@@ -1,6 +1,8 @@
 import telebot
 import os
 import logging
+from dotenv import load_dotenv
+load_dotenv()
 import time
 import json
 from telebot import types
@@ -74,7 +76,7 @@ def get_allowed_set():
 # ============================================================
 # ТОКЕН
 # ============================================================
-TOKEN = os.getenv('BOT_TOKEN') or '8862495343:AAHMybq7S1ueTzzk2oWrf9nNUZ3dDdah6ow'
+TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     # Для локальной разработки раскомментируй:
     #TOKEN = 'ОШИБКА'
