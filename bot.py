@@ -68,6 +68,7 @@ kb            = load_json('knowledge_base.json', DEFAULT_KB)
 MASTER_ID = 882100075
 _seen_users = set()
 user_states = {}
+user_context = {}  # user_id -> список частей пути (для навигации)
 
 album_cache = {}
 album_timers = {}
@@ -170,7 +171,6 @@ _search_cache_time = {}
 
 def search_kb(query):
     now = time.time()
-    # Проверяем кеш
     if query in _search_cache and (now - _search_cache_time.get(query, 0)) < 30:
         return _search_cache[query]
 
@@ -206,30 +206,30 @@ def search_kb(query):
     results.sort(key=lambda x: x['score'], reverse=True)
     logger.info(f"Поиск: {query!r} → {len(results)} результатов")
 
-    # Сохраняем в кеш
     _search_cache[query] = results
     _search_cache_time[query] = now
     return results[:10]
 
 # ============================================================
-# НАВИГАЦИЯ
+# НАВИГАЦИЯ (С КОНТЕКСТОМ)
 # ============================================================
 
 def make_back_keyboard(path_parts):
     markup = types.InlineKeyboardMarkup()
     if len(path_parts) > 1:
-        back_path = "main|" + "|".join(path_parts[:-1])
-        markup.add(types.InlineKeyboardButton("← Назад", callback_data=back_path))
+        markup.add(types.InlineKeyboardButton("← Назад", callback_data="back"))
     markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main"))
     return markup
 
 def show_main_menu(chat_id, message_id=None):
+    # Сбрасываем контекст
+    user_context[chat_id] = []
     markup = types.InlineKeyboardMarkup()
     for name in kb['main_menu'].keys():
-        markup.add(types.InlineKeyboardButton(name, callback_data=f"main|{name}"))
+        markup.add(types.InlineKeyboardButton(name, callback_data=f"go|{name}"))
     text = "📋 Выберите раздел:"
     if message_id:
-        safe_edit(chat_id, message_id, text, markup)  # редактируем существующее
+        safe_edit(chat_id, message_id, text, markup)
     else:
         try:
             bot.send_message(chat_id, text, reply_markup=markup)
@@ -296,27 +296,23 @@ def send_content_node(chat_id, message_id, node, path_parts):
             pass
 
 def show_category_menu(chat_id, message_id, children, path_parts):
-    # Если детей нет — показываем сообщение
+    # Сохраняем текущий путь в контекст
+    user_context[chat_id] = path_parts
+
     if not children:
         markup = types.InlineKeyboardMarkup()
         if len(path_parts) > 0:
-            back_cb = "main|" + "|".join(path_parts[:-1]) if len(path_parts) > 1 else "main"
-            markup.add(types.InlineKeyboardButton("← Назад", callback_data=back_cb))
+            markup.add(types.InlineKeyboardButton("← Назад", callback_data="back"))
         markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main"))
         safe_edit(chat_id, message_id, "📭 В этом разделе пока нет материалов.", markup)
         return
 
-    # Строим клавиатуру из детей
     markup = types.InlineKeyboardMarkup()
     for name in children.keys():
-        cb = "main|" + "|".join(path_parts + [name])
-        markup.add(types.InlineKeyboardButton(name, callback_data=cb))
-
+        markup.add(types.InlineKeyboardButton(name, callback_data=f"go|{name}"))
     if len(path_parts) > 0:
-        back_cb = "main|" + "|".join(path_parts[:-1]) if len(path_parts) > 1 else "main"
-        markup.add(types.InlineKeyboardButton("← Назад", callback_data=back_cb))
+        markup.add(types.InlineKeyboardButton("← Назад", callback_data="back"))
     markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main"))
-
     safe_edit(chat_id, message_id, "📂 Выберите подраздел:", markup)
 
 # ============================================================
@@ -611,7 +607,6 @@ def cmd_add_category(message):
     new_name = args[2].strip()
     path_parts = path_str.split('/') if path_str else []
 
-    # Идём по всем частям пути, чтобы найти родительскую категорию
     parent = kb['main_menu']
     for key in path_parts:
         if key in parent and parent[key].get('type') == 'category':
@@ -620,7 +615,6 @@ def cmd_add_category(message):
             bot.send_message(message.chat.id, f"❌ Путь не найден: {key}")
             return
 
-    # Проверяем, не существует ли уже категория с таким именем
     if new_name in parent:
         bot.send_message(message.chat.id, f"⚠️ Элемент '{new_name}' уже существует.")
         return
@@ -742,7 +736,6 @@ def cmd_search(message):
     if len(query) > 50:
         query = query[:50]
 
-    # Экранируем запрос для безопасного использования в HTML
     query_safe = query.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
     results = search_kb(query)
@@ -763,7 +756,7 @@ def cmd_search(message):
 
     markup = types.InlineKeyboardMarkup()
     for r in results:
-        cb = "main|" + "|".join(r['path'])
+        cb = "go|" + r['title']  # короткий callback, путь не нужен
         if len(cb.encode('utf-8')) <= 64:
             markup.add(types.InlineKeyboardButton(
                 f"📄 {r['title']}", callback_data=cb
@@ -952,7 +945,7 @@ def handle_all_messages(message):
             if results:
                 markup = types.InlineKeyboardMarkup()
                 for r in results[:5]:
-                    cb = "main|" + "|".join(r['path'])
+                    cb = "go|" + r['title']
                     if len(cb.encode('utf-8')) <= 64:
                         markup.add(types.InlineKeyboardButton(
                             f"📄 {r['title']}", callback_data=cb
@@ -960,7 +953,6 @@ def handle_all_messages(message):
                 markup.add(types.InlineKeyboardButton(
                     "🏠 Главное меню", callback_data="main"
                 ))
-                # Экранируем query для HTML
                 query_safe = query.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                 bot.send_message(
                     message.chat.id,
@@ -1000,7 +992,7 @@ def handle_all_messages(message):
 
 
 # ============================================================
-# ОБРАБОТКА КНОПОК
+# ОБРАБОТКА КНОПОК (С КОНТЕКСТОМ)
 # ============================================================
 @bot.callback_query_handler(func=lambda call: True)
 def handle(call):
@@ -1016,55 +1008,82 @@ def handle(call):
     logger.info(f"Кнопка '{data}' от {user_id}")
 
     try:
+        # ---- Главное меню ----
         if data == "main":
+            user_context[user_id] = []
             show_main_menu(chat_id, message_id)
             update_stats(user_id)
             answer_query(call.id)
             return
 
-        if not data.startswith("main|"):
-            answer_query(call.id, "Неизвестная команда")
+        # ---- Возврат на уровень назад ----
+        if data == "back":
+            path_parts = user_context.get(user_id, [])
+            if not path_parts:
+                show_main_menu(chat_id, message_id)
+                answer_query(call.id)
+                return
+            # Убираем последний элемент
+            parent_path = path_parts[:-1]
+            user_context[user_id] = parent_path
+            # Ищем родительскую категорию
+            node = kb['main_menu']
+            for key in parent_path:
+                if key in node:
+                    node = node[key]
+                    if node['type'] == 'category':
+                        node = node['children']
+                    else:
+                        # Если родитель — контент (не должно быть)
+                        show_main_menu(chat_id, message_id)
+                        answer_query(call.id)
+                        return
+                else:
+                    show_main_menu(chat_id, message_id)
+                    answer_query(call.id)
+                    return
+            show_category_menu(chat_id, message_id, node, parent_path)
+            update_stats(user_id)
+            answer_query(call.id)
             return
 
-        path_parts = data.split("|")[1:]
-        node = kb['main_menu']
-
-        for i, key in enumerate(path_parts):
-            if not isinstance(node, dict) or key not in node:
-                answer_query(call.id, "Раздел не найден")
-                return
-
-            current = node[key]
-
-            if i == len(path_parts) - 1:
-                if current.get('type') == 'content':
-                    send_content_node(chat_id, message_id, current, path_parts)
-                    update_stats(user_id)
-                    answer_query(call.id)
-                    return
-                elif current.get('type') == 'category':
-                    show_category_menu(
-                        chat_id, message_id,
-                        current.get('children', {}),
-                        path_parts
-                    )
-                    update_stats(user_id)
-                    answer_query(call.id)
-                    return
-            else:
-                if current.get('type') == 'category':
-                    node = current.get('children', {})
+        # ---- Переход по имени ----
+        if data.startswith("go|"):
+            name = data.split("|", 1)[1]
+            # Получаем текущий путь из контекста
+            path_parts = user_context.get(user_id, [])
+            full_path = path_parts + [name]
+            # Ищем узел
+            node = kb['main_menu']
+            for key in full_path:
+                if key in node:
+                    node = node[key]
+                    if node['type'] == 'category':
+                        node = node['children']
+                    else:
+                        # Контент
+                        send_content_node(chat_id, message_id, node, full_path)
+                        update_stats(user_id)
+                        answer_query(call.id)
+                        return
                 else:
                     answer_query(call.id, "Раздел не найден")
                     return
+            # Если дошли до категории
+            show_category_menu(chat_id, message_id, node, full_path)
+            user_context[user_id] = full_path
+            update_stats(user_id)
+            answer_query(call.id)
+            return
+
+        # ---- Если что-то не распознано ----
+        answer_query(call.id, "Неизвестная команда")
 
     except Exception as e:
         logger.error(f"Ошибка при кнопке '{data}': {e}")
         notify_admins(f"Ошибка при кнопке '{data}': {e}", is_error=True)
         answer_query(call.id, "Произошла ошибка, попробуйте ещё раз", alert=True)
         return
-
-    answer_query(call.id)
 
 
 # ============================================================
