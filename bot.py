@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# РАБОТА С JSON
+# РАБОТА С JSON (С МИГРАЦИЕЙ КЛЮЧЕЙ)
 # ============================================================
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -24,14 +24,25 @@ def load_json(filename, default):
     path = os.path.join(DATA_DIR, filename)
     if not os.path.exists(path):
         save_json(filename, default)
-        return json.loads(json.dumps(default))
+        return default.copy() if isinstance(default, dict) else default
+
     try:
         with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(default, dict):
+            changed = False
+            for key, val in default.items():
+                if key not in data:
+                    data[key] = val
+                    logger.warning(f"Добавлен ключ {key} в {filename}")
+                    changed = True
+            if changed:
+                save_json(filename, data)
+        return data
     except (json.JSONDecodeError, ValueError, IOError) as e:
         logger.warning(f"Ошибка чтения {filename}: {e}. Сбрасываю к default.")
         save_json(filename, default)
-        return json.loads(json.dumps(default))
+        return default.copy() if isinstance(default, dict) else default
 
 def save_json(filename, data):
     path = os.path.join(DATA_DIR, filename)
@@ -44,7 +55,7 @@ def save_json(filename, data):
 # ============================================================
 # ЗАГРУЗКА ДАННЫХ
 # ============================================================
-DEFAULT_ALLOWED = [882100075, 230729589]
+DEFAULT_ALLOWED = [882100075, 230729589, 675620479, 1042967059, 6481635279, 1699807628]
 DEFAULT_ADMINS  = [882100075]
 DEFAULT_STATS   = {"total_clicks": 0, "unique_users": 0, "last_activity": None}
 DEFAULT_KB      = {"main_menu": {}}
@@ -54,22 +65,15 @@ ADMIN_IDS     = load_json('admin_ids.json',     DEFAULT_ADMINS)
 stats         = load_json('stats.json',          DEFAULT_STATS)
 kb            = load_json('knowledge_base.json', DEFAULT_KB)
 
-# Главный администратор — нельзя удалить
 MASTER_ID = 882100075
-
 _seen_users = set()
 user_states = {}
 
-# ============================================================
-# КЕШ АЛЬБОМОВ С БЛОКИРОВКОЙ
-# ============================================================
 album_cache = {}
 album_timers = {}
-album_lock = threading.Lock()   # <--- защита от гонок
+album_lock = threading.Lock()
+user_states_lock = threading.Lock()
 
-# ============================================================
-# ТОКЕН
-# ============================================================
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     logger.error("=" * 50)
@@ -82,8 +86,10 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 
 if not kb.get('main_menu'):
-    logger.critical("knowledge_base.json пустой или повреждён!")
-    exit(1)
+    logger.critical("knowledge_base.json пустой или повреждён! Создаю пустую структуру.")
+    kb = {"main_menu": {}}
+    save_json('knowledge_base.json', kb)
+
 logger.info(f"База знаний загружена. Разделов: {len(kb['main_menu'])}")
 
 # ============================================================
@@ -157,6 +163,36 @@ def safe_edit(chat_id, message_id, text, keyboard, parse_mode=None):
             logger.error(f"send тоже не удался: {e2}")
 
 # ============================================================
+# ПОИСК ПО БАЗЕ ЗНАНИЙ
+# ============================================================
+
+def search_kb(query):
+    """Ищет query по всем текстам в knowledge_base.json.
+    Возвращает список словарей: {path, title, preview}"""
+    results = []
+    query_lower = query.lower()
+
+    def traverse(node, current_path):
+        for key, value in node.items():
+            path = current_path + [key]
+            if value.get('type') == 'category':
+                traverse(value.get('children', {}), path)
+            elif value.get('type') == 'content':
+                data = value.get('data', '')
+                # Ищем в названии и в тексте
+                if (query_lower in key.lower() or
+                    (isinstance(data, str) and query_lower in data.lower())):
+                    preview = data[:100] + '...' if isinstance(data, str) and len(data) > 100 else data
+                    results.append({
+                        'path': path,
+                        'title': key,
+                        'preview': preview if isinstance(data, str) else '📎 Медиафайл'
+                    })
+
+    traverse(kb['main_menu'], [])
+    return results[:10]  # максимум 10 результатов
+
+# ============================================================
 # НАВИГАЦИЯ
 # ============================================================
 
@@ -180,17 +216,6 @@ def show_main_menu(chat_id, message_id=None):
             bot.send_message(chat_id, text, reply_markup=markup)
         except Exception as e:
             logger.error(f"Ошибка показа меню: {e}")
-
-def get_node_by_path(path_parts):
-    node = kb['main_menu']
-    for key in path_parts:
-        if isinstance(node, dict) and key in node:
-            node = node[key]
-            if isinstance(node, dict) and node.get('type') == 'category':
-                node = node['children']
-        else:
-            return None
-    return node
 
 def send_content_node(chat_id, message_id, node, path_parts):
     content_type = node.get('content_type', 'text')
@@ -268,7 +293,7 @@ def show_category_menu(chat_id, message_id, children, path_parts):
     safe_edit(chat_id, message_id, "📂 Выберите подраздел:", markup)
 
 # ============================================================
-# ФИНАЛИЗАЦИЯ АЛЬБОМА С БЛОКИРОВКОЙ
+# ФИНАЛИЗАЦИЯ АЛЬБОМА
 # ============================================================
 def finalize_album(media_group_id, chat_id):
     with album_lock:
@@ -280,11 +305,9 @@ def finalize_album(media_group_id, chat_id):
         content_type = album["content_type"]
         files = album["files"]
         caption = album["caption"]
-        # Удаляем из кеша
         del album_cache[media_group_id]
-        album_timers.pop(media_group_id, None)  # безопасно удаляем таймер
+        album_timers.pop(media_group_id, None)
 
-    # Находим родительскую категорию (вне блокировки, т.к. работаем с kb)
     parent = kb['main_menu']
     for key in path_parts:
         if key in parent and parent[key].get('type') == 'category':
@@ -293,19 +316,16 @@ def finalize_album(media_group_id, chat_id):
             bot.send_message(chat_id, f"❌ Путь не найден: {key}")
             return
 
-    # Если одно фото – сохраняем как строку, иначе список
     data = files[0] if len(files) == 1 else files
-
-    # Сохраняем состояние для ввода названия кнопки
-    user_states[user_id] = {
-        "step": "waiting_label",
-        "path": path_parts,
-        "content_type": content_type,
-        "data": data,
-        "caption": caption,
-        "is_album": len(files) > 1
-    }
-
+    with user_states_lock:
+        user_states[user_id] = {
+            "step": "waiting_label",
+            "path": path_parts,
+            "content_type": content_type,
+            "data": data,
+            "caption": caption,
+            "is_album": len(files) > 1
+        }
     bot.send_message(
         chat_id,
         f"📸 {'Альбом' if len(files) > 1 else 'Фото'} собран ({len(files)} шт.).\n"
@@ -314,7 +334,7 @@ def finalize_album(media_group_id, chat_id):
     )
 
 # ============================================================
-# КОМАНДЫ (без изменений)
+# КОМАНДЫ
 # ============================================================
 
 @bot.message_handler(commands=['start', 'menu'])
@@ -352,7 +372,8 @@ def cmd_help(message):
         "<b>Команды для всех:</b>\n"
         "/start — главное меню\n"
         "/id — ваш Телеграм ID\n"
-        "/help — эта справка\n\n"
+        "/help — эта справка\n"
+        "/search текст — поиск по базе знаний\n\n"
         "<b>Для администраторов:</b>\n"
         "/stats — статистика\n"
         "/listusers — список пользователей\n"
@@ -661,10 +682,62 @@ def cmd_cancel(message):
         bot.send_message(message.chat.id, "Нет активных действий.")
 
 
-# ============================================================
-# ЕДИНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ (с поддержкой альбомов, исправленный)
-# ============================================================
+@bot.message_handler(commands=['search'])
+def cmd_search(message):
+    if not check_access(message.from_user.id, message.chat.id):
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        bot.send_message(
+            message.chat.id,
+            "🔍 Использование: /search текст\n"
+            "Пример: /search маткапитал"
+        )
+        return
 
+    query = args[1].strip()
+    results = search_kb(query)
+
+    if not results:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(
+            "🏠 Главное меню", callback_data="main"
+        ))
+        bot.send_message(
+            message.chat.id,
+            f"🔍 По запросу <b>{query}</b> ничего не найдено.\n"
+            f"Попробуйте другое слово.",
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    for r in results:
+        cb = "main|" + "|".join(r['path'])
+        if len(cb.encode('utf-8')) <= 64:
+            markup.add(types.InlineKeyboardButton(
+                f"📄 {r['title']}", callback_data=cb
+            ))
+    markup.add(types.InlineKeyboardButton(
+        "🏠 Главное меню", callback_data="main"
+    ))
+
+    text = f"🔍 По запросу <b>{query}</b> найдено {len(results)}:\n\n"
+    for r in results:
+        text += f"• <b>{r['title']}</b>\n  {r['preview']}\n\n"
+
+    bot.send_message(
+        message.chat.id,
+        text,
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+
+
+# ============================================================
+# ЕДИНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ (с поиском по тексту)
+# ============================================================
 @bot.message_handler(content_types=['text', 'photo', 'document'])
 def handle_all_messages(message):
     user_id = message.from_user.id
@@ -682,7 +755,6 @@ def handle_all_messages(message):
 
             media_group_id = message.media_group_id
             if media_group_id:
-                # Используем блокировку для работы с album_cache
                 with album_lock:
                     if media_group_id not in album_cache:
                         album_cache[media_group_id] = {
@@ -692,31 +764,23 @@ def handle_all_messages(message):
                             "content_type": content_type,
                             "caption": message.caption or ""
                         }
-                    # Добавляем file_id
                     file_id = message.photo[-1].file_id
                     album_cache[media_group_id]["files"].append(file_id)
-                    # Обновляем caption (берём от первого)
                     if not album_cache[media_group_id]["caption"] and message.caption:
                         album_cache[media_group_id]["caption"] = message.caption
-
                     is_first = len(album_cache[media_group_id]["files"]) == 1
 
-                    # Отменяем старый таймер
                     if media_group_id in album_timers:
                         album_timers[media_group_id].cancel()
-
-                    # Устанавливаем новый таймер на 5 секунд
                     timer = threading.Timer(5.0, finalize_album, args=[media_group_id, message.chat.id])
                     timer.daemon = True
                     timer.start()
                     album_timers[media_group_id] = timer
 
-                # Сообщение отправляем только для первого фото
                 if is_first:
                     bot.send_message(
                         message.chat.id,
-                        "📸 Получил первое фото. Отправьте остальные — "
-                        "через 5 сек обработаю весь альбом."
+                        "📸 Получил первое фото. Отправьте остальные — через 5 сек обработаю весь альбом."
                     )
                 return
             else:
@@ -803,15 +867,53 @@ def handle_all_messages(message):
         )
         return
 
-    # --- Обычное сообщение ---
+    # --- Обычное сообщение — автопоиск ---
     if user_id in get_allowed_set():
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main"))
-        bot.send_message(
-            message.chat.id,
-            "📌 Используйте кнопки меню. Нажмите /start чтобы открыть меню.",
-            reply_markup=markup
-        )
+        # Если написал текст длиннее 2 символов — ищем
+        if message.text and len(message.text.strip()) > 2:
+            query = message.text.strip()
+            results = search_kb(query)
+
+            if results:
+                markup = types.InlineKeyboardMarkup()
+                for r in results[:5]:  # топ 5 в кнопках
+                    cb = "main|" + "|".join(r['path'])
+                    if len(cb.encode('utf-8')) <= 64:
+                        markup.add(types.InlineKeyboardButton(
+                            f"📄 {r['title']}", callback_data=cb
+                        ))
+                markup.add(types.InlineKeyboardButton(
+                    "🏠 Главное меню", callback_data="main"
+                ))
+                bot.send_message(
+                    message.chat.id,
+                    f"🔍 Нашёл по запросу <b>{query}</b>:\n\n" +
+                    "\n".join(f"• {r['title']}" for r in results[:5]),
+                    parse_mode="HTML",
+                    reply_markup=markup
+                )
+            else:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton(
+                    "🏠 Главное меню", callback_data="main"
+                ))
+                bot.send_message(
+                    message.chat.id,
+                    f"🔍 По запросу <b>{query}</b> ничего не найдено.\n"
+                    f"Используйте кнопки меню или /search другое_слово",
+                    parse_mode="HTML",
+                    reply_markup=markup
+                )
+        else:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton(
+                "🏠 Главное меню", callback_data="main"
+            ))
+            bot.send_message(
+                message.chat.id,
+                "📌 Напишите слово для поиска или используйте /start",
+                reply_markup=markup
+            )
     else:
         bot.send_message(
             message.chat.id,
@@ -822,7 +924,6 @@ def handle_all_messages(message):
 # ============================================================
 # ОБРАБОТКА КНОПОК
 # ============================================================
-
 @bot.callback_query_handler(func=lambda call: True)
 def handle(call):
     user_id    = call.from_user.id
@@ -891,7 +992,6 @@ def handle(call):
 # ============================================================
 # ЗАПУСК С АВТОПЕРЕЗАПУСКОМ
 # ============================================================
-
 if __name__ == "__main__":
     logger.info("🚀 Бот ДЦША запущен.")
     notify_admins("✅ Бот запущен и работает.")
