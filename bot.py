@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import time
+import threading
 from telebot import types
 from dotenv import load_dotenv
 
@@ -53,11 +54,18 @@ ADMIN_IDS     = load_json('admin_ids.json',     DEFAULT_ADMINS)
 stats         = load_json('stats.json',          DEFAULT_STATS)
 kb            = load_json('knowledge_base.json', DEFAULT_KB)
 
-# Главный администратор — нельзя удалить никакими командами
+# Главный администратор — нельзя удалить
 MASTER_ID = 882100075
 
 _seen_users = set()
 user_states = {}
+
+# ============================================================
+# КЕШ АЛЬБОМОВ С БЛОКИРОВКОЙ
+# ============================================================
+album_cache = {}
+album_timers = {}
+album_lock = threading.Lock()   # <--- защита от гонок
 
 # ============================================================
 # ТОКЕН
@@ -174,7 +182,6 @@ def show_main_menu(chat_id, message_id=None):
             logger.error(f"Ошибка показа меню: {e}")
 
 def get_node_by_path(path_parts):
-    """Вспомогательная — идёт по дереву kb по списку ключей."""
     node = kb['main_menu']
     for key in path_parts:
         if isinstance(node, dict) and key in node:
@@ -186,12 +193,6 @@ def get_node_by_path(path_parts):
     return node
 
 def send_content_node(chat_id, message_id, node, path_parts):
-    """
-    ИСПРАВЛЕНИЕ 1: parse_mode='HTML' ТОЛЬКО для text_with_link, photo, document.
-    Для content_type='text' — БЕЗ parse_mode.
-    Причина: тексты скриптов содержат → < > которые Телеграм парсит как HTML-теги
-    и отказывается отправлять сообщение.
-    """
     content_type = node.get('content_type', 'text')
     data         = node.get('data', '')
     caption      = node.get('caption', '')
@@ -201,11 +202,9 @@ def send_content_node(chat_id, message_id, node, path_parts):
 
     try:
         if content_type == 'text':
-            # БЕЗ parse_mode — тексты могут содержать < > →
             bot.send_message(chat_id, data, reply_markup=keyboard)
 
         elif content_type == 'text_with_link':
-            # С HTML — здесь намеренно используются теги <a href>
             bot.send_message(
                 chat_id, data,
                 reply_markup=keyboard,
@@ -214,12 +213,22 @@ def send_content_node(chat_id, message_id, node, path_parts):
             )
 
         elif content_type == 'photo':
-            bot.send_photo(
-                chat_id, data,
-                caption=caption,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
+            if isinstance(data, list):
+                media_group = []
+                for i, file_id in enumerate(data):
+                    if i == 0:
+                        media_group.append(types.InputMediaPhoto(media=file_id, caption=caption, parse_mode="HTML"))
+                    else:
+                        media_group.append(types.InputMediaPhoto(media=file_id))
+                bot.send_media_group(chat_id, media_group)
+                bot.send_message(chat_id, "📸 Альбом отправлен.", reply_markup=keyboard)
+            else:
+                bot.send_photo(
+                    chat_id, data,
+                    caption=caption,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
 
         elif content_type == 'document':
             bot.send_document(
@@ -259,7 +268,53 @@ def show_category_menu(chat_id, message_id, children, path_parts):
     safe_edit(chat_id, message_id, "📂 Выберите подраздел:", markup)
 
 # ============================================================
-# КОМАНДЫ
+# ФИНАЛИЗАЦИЯ АЛЬБОМА С БЛОКИРОВКОЙ
+# ============================================================
+def finalize_album(media_group_id, chat_id):
+    with album_lock:
+        if media_group_id not in album_cache:
+            return
+        album = album_cache[media_group_id]
+        user_id = album["user_id"]
+        path_parts = album["path"]
+        content_type = album["content_type"]
+        files = album["files"]
+        caption = album["caption"]
+        # Удаляем из кеша
+        del album_cache[media_group_id]
+        album_timers.pop(media_group_id, None)  # безопасно удаляем таймер
+
+    # Находим родительскую категорию (вне блокировки, т.к. работаем с kb)
+    parent = kb['main_menu']
+    for key in path_parts:
+        if key in parent and parent[key].get('type') == 'category':
+            parent = parent[key]['children']
+        else:
+            bot.send_message(chat_id, f"❌ Путь не найден: {key}")
+            return
+
+    # Если одно фото – сохраняем как строку, иначе список
+    data = files[0] if len(files) == 1 else files
+
+    # Сохраняем состояние для ввода названия кнопки
+    user_states[user_id] = {
+        "step": "waiting_label",
+        "path": path_parts,
+        "content_type": content_type,
+        "data": data,
+        "caption": caption,
+        "is_album": len(files) > 1
+    }
+
+    bot.send_message(
+        chat_id,
+        f"📸 {'Альбом' if len(files) > 1 else 'Фото'} собран ({len(files)} шт.).\n"
+        f"Введите название кнопки для этого контента:",
+        parse_mode="HTML"
+    )
+
+# ============================================================
+# КОМАНДЫ (без изменений)
 # ============================================================
 
 @bot.message_handler(commands=['start', 'menu'])
@@ -282,7 +337,6 @@ def cmd_start(message):
 
 @bot.message_handler(commands=['id'])
 def cmd_id(message):
-    # ИСПРАВЛЕНИЕ 4: <code> вместо backticks — правильный HTML
     bot.send_message(
         message.chat.id,
         f"🆔 Ваш Телеграм ID: <code>{message.from_user.id}</code>\n\n"
@@ -473,9 +527,6 @@ def cmd_list_tree(message):
 
 @bot.message_handler(commands=['reloadkb'])
 def cmd_reload_kb(message):
-    """
-    ИСПРАВЛЕНИЕ 2: используем DATA_DIR — работает и локально и на Railway.
-    """
     if not is_admin(message.from_user.id):
         bot.send_message(message.chat.id, "🚫 Только для администраторов.")
         return
@@ -587,7 +638,7 @@ def cmd_add_content_start(message):
     type_hints = {
         "text":          "напишите текст",
         "text_with_link":"напишите текст с HTML-ссылками: &lt;a href='url'&gt;текст&lt;/a&gt;",
-        "photo":         "отправьте фото",
+        "photo":         "отправьте фото (можно сразу несколько в альбоме)",
         "document":      "отправьте файл (PDF и др.)"
     }
     hint = type_hints.get(content_type, "отправьте контент")
@@ -611,14 +662,7 @@ def cmd_cancel(message):
 
 
 # ============================================================
-# ЕДИНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
-#
-# ИСПРАВЛЕНИЕ 3 — конфликт обработчиков:
-# В pyTelegramBotAPI первый совпавший обработчик забирает сообщение.
-# Нельзя иметь отдельные handle_content_input + handle_content_label + echo_all —
-# handle_content_input с content_types=['text',...] перехватывает ВСЁ
-# и echo_all никогда не вызывается.
-# Решение: один обработчик handle_all_messages со всей логикой внутри.
+# ЕДИНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ (с поддержкой альбомов, исправленный)
 # ============================================================
 
 @bot.message_handler(content_types=['text', 'photo', 'document'])
@@ -630,18 +674,69 @@ def handle_all_messages(message):
     if state and state.get("step") == "waiting_data":
         content_type = state.get("content_type", "text")
 
+        # --- Обработка фото (одиночное или альбом) ---
+        if content_type == 'photo':
+            if not message.photo:
+                bot.send_message(message.chat.id, "❌ Отправьте фото.")
+                return
+
+            media_group_id = message.media_group_id
+            if media_group_id:
+                # Используем блокировку для работы с album_cache
+                with album_lock:
+                    if media_group_id not in album_cache:
+                        album_cache[media_group_id] = {
+                            "files": [],
+                            "user_id": user_id,
+                            "path": state.get("path", []),
+                            "content_type": content_type,
+                            "caption": message.caption or ""
+                        }
+                    # Добавляем file_id
+                    file_id = message.photo[-1].file_id
+                    album_cache[media_group_id]["files"].append(file_id)
+                    # Обновляем caption (берём от первого)
+                    if not album_cache[media_group_id]["caption"] and message.caption:
+                        album_cache[media_group_id]["caption"] = message.caption
+
+                    is_first = len(album_cache[media_group_id]["files"]) == 1
+
+                    # Отменяем старый таймер
+                    if media_group_id in album_timers:
+                        album_timers[media_group_id].cancel()
+
+                    # Устанавливаем новый таймер на 5 секунд
+                    timer = threading.Timer(5.0, finalize_album, args=[media_group_id, message.chat.id])
+                    timer.daemon = True
+                    timer.start()
+                    album_timers[media_group_id] = timer
+
+                # Сообщение отправляем только для первого фото
+                if is_first:
+                    bot.send_message(
+                        message.chat.id,
+                        "📸 Получил первое фото. Отправьте остальные — "
+                        "через 5 сек обработаю весь альбом."
+                    )
+                return
+            else:
+                # Одиночное фото
+                data = message.photo[-1].file_id
+                caption = message.caption or ""
+                state.update({"step": "waiting_label", "data": data, "caption": caption})
+                bot.send_message(
+                    message.chat.id,
+                    "🔑 Введите название кнопки для этого контента.\nПример: <b>Фото</b>",
+                    parse_mode="HTML"
+                )
+                return
+
+        # --- Обработка текста, text_with_link и document ---
         if content_type in ('text', 'text_with_link'):
             if not message.text:
                 bot.send_message(message.chat.id, "❌ Отправьте текстовое сообщение.")
                 return
             data, caption = message.text, ""
-
-        elif content_type == 'photo':
-            if not message.photo:
-                bot.send_message(message.chat.id, "❌ Отправьте фото.")
-                return
-            data    = message.photo[-1].file_id
-            caption = message.caption or ""
 
         elif content_type == 'document':
             if not message.document:
@@ -658,8 +753,7 @@ def handle_all_messages(message):
         state.update({"step": "waiting_label", "data": data, "caption": caption})
         bot.send_message(
             message.chat.id,
-            "🔑 Введите название кнопки для этого контента.\n"
-            "Пример: <b>Новое возражение</b>",
+            "🔑 Введите название кнопки для этого контента.\nПример: <b>Новое возражение</b>",
             parse_mode="HTML"
         )
         return
