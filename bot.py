@@ -191,32 +191,26 @@ def resolve_path(path_parts):
             return None, None, None
         actual_keys.append(found_key)
         val = node[found_key]
-        # Если последний элемент пути — возвращаем что это
         if i == len(path_parts) - 1:
             return val, actual_keys, val.get('type')
-        # Иначе должны спуститься глубже — только если категория
         if val.get('type') == 'category':
             node = val['children']
         else:
-            # Путь продолжается, но это контент — спуститься нельзя
             return None, None, 'content'
-    # Пустой путь
     return None, None, None
 
 def get_children(path_parts):
-    """Возвращает children словарь категории по пути (с нормализацией). None если путь не категория."""
     if not path_parts:
         return kb['main_menu']
-    val, actual_keys, ntype = resolve_path(path_parts)
+    val, _, ntype = resolve_path(path_parts)
     if ntype == 'category':
         return val['children']
     return None
 
 def get_actual_path(path_parts):
-    """Возвращает реальные ключи пути (с правильными пробелами) или None."""
     if not path_parts:
         return []
-    val, actual_keys, ntype = resolve_path(path_parts)
+    _, actual_keys, _ = resolve_path(path_parts)
     return actual_keys
 
 def parse_quoted(text):
@@ -436,9 +430,7 @@ def cmd_help(message):
         "<b>Примеры:</b>\n"
         '<code>/addcontent "Отдел продаж/Материалы" text</code>\n'
         '<code>/setcontent "Отдел продаж/Материалы/Оферта" text_with_link</code>\n'
-        '<code>/delete "Отдел продаж/Бонусы"</code>\n\n'
-        "💡 <b>addcontent</b> — добавляет НОВЫЙ материал внутрь ПАПКИ.\n"
-        "💡 <b>setcontent</b> — меняет содержимое СУЩЕСТВУЮЩЕГО материала."
+        '<code>/delete "Отдел продаж/Бонусы"</code>'
     )
     bot.send_message(message.chat.id, text, parse_mode="HTML")
 
@@ -642,15 +634,13 @@ def cmd_add_category(message):
     path_parts = split_path(path_str)
     parent = get_children(path_parts)
     if parent is None:
-        # Уточняем причину
-        if path_parts:
-            val, _, ntype = resolve_path(path_parts)
-            if ntype == 'content':
-                bot.send_message(message.chat.id,
-                    f"❌ <b>{escape_html('/'.join(path_parts))}</b> — это материал, а не папка.\n"
-                    f"Категорию можно создать только внутри папки.",
-                    parse_mode="HTML")
-                return
+        val, _, ntype = resolve_path(path_parts)
+        if ntype == 'content':
+            bot.send_message(message.chat.id,
+                f"❌ <b>{escape_html('/'.join(path_parts))}</b> — это материал, а не папка.\n"
+                f"Категорию можно создать только внутри папки.",
+                parse_mode="HTML")
+            return
         bot.send_message(message.chat.id, f"❌ Путь не найден: {escape_html('/'.join(path_parts))}")
         return
 
@@ -667,27 +657,45 @@ def cmd_add_category(message):
     bot.send_message(message.chat.id, f"✅ Папка <b>{escape_html(new_name)}</b> создана в {escape_html(location)}.", parse_mode="HTML")
 
 
+# ============================================================
+# ИСПРАВЛЕННАЯ КОМАНДА DELETE (поддерживает удаление элементов с / в названии)
+# ============================================================
 @bot.message_handler(commands=['delete'])
 def cmd_delete(message):
     if not is_admin(message.from_user.id):
         bot.send_message(message.chat.id, "🚫 Только для администраторов.")
         return
+
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         bot.send_message(message.chat.id,
             'ℹ️ Использование: /delete "путь"\nПример: /delete "Отдел продаж/Бонусы"',
             parse_mode="HTML")
         return
-    raw = parts[1].strip().strip('"')
-    path_parts = split_path(raw)
+
+    # Получаем путь из кавычек (если они есть) или целиком
+    raw = parts[1].strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        path_str = raw[1:-1]
+    else:
+        path_str = raw
+
+    # Разбиваем по /, но если в названии есть / — это не проблема, потому что весь путь взят в кавычки
+    path_parts = [p.strip() for p in path_str.split('/') if p.strip()]
     if not path_parts:
         bot.send_message(message.chat.id, "❌ Нельзя удалить главное меню.")
         return
+
+    # Идём к родителю
     parent = get_children(path_parts[:-1])
     if parent is None:
+        # Проверим, может быть путь указывает на контент (тогда parent должен быть на уровень выше)
+        # Но мы уже сделали parent = get_children(path_parts[:-1]), так что если родитель не найден — ошибка.
         bot.send_message(message.chat.id, f"❌ Путь не найден: {escape_html('/'.join(path_parts[:-1]))}")
         return
-    norm_target = normalize_key(path_parts[-1]).lower()
+
+    target = path_parts[-1]
+    norm_target = normalize_key(target).lower()
     found = None
     for key in parent.keys():
         if normalize_key(key).lower() == norm_target:
@@ -699,11 +707,14 @@ def cmd_delete(message):
         _invalidate_search_cache()
         bot.send_message(message.chat.id, f"✅ Элемент <b>{escape_html(found)}</b> удалён.", parse_mode="HTML")
     else:
-        bot.send_message(message.chat.id, f"❌ Элемент '{path_parts[-1]}' не найден.")
+        bot.send_message(message.chat.id, f"❌ Элемент '{target}' не найден.")
 
+
+# ============================================================
+# ОСТАЛЬНЫЕ КОМАНДЫ (addcontent, setcontent, search, etc.)
+# ============================================================
 
 def _start_content_input(message, path_parts, content_type, mode):
-    """Общая логика для addcontent и setcontent. mode = 'add' | 'set'."""
     with user_states_lock:
         user_states[message.from_user.id] = {
             "step": "waiting_data",
@@ -728,7 +739,6 @@ def _start_content_input(message, path_parts, content_type, mode):
 
 @bot.message_handler(commands=['addcontent'])
 def cmd_add_content_start(message):
-    """Добавляет НОВЫЙ материал ВНУТРЬ существующей папки (категории)."""
     if not is_admin(message.from_user.id):
         bot.send_message(message.chat.id, "🚫 Только для администраторов.")
         return
@@ -737,8 +747,7 @@ def cmd_add_content_start(message):
         bot.send_message(message.chat.id,
             'ℹ️ Использование:\n<code>/addcontent "путь к ПАПКЕ" тип</code>\n'
             "Типы: text, photo, document, text_with_link\n\n"
-            'Пример: <code>/addcontent "Отдел продаж/Материалы" text</code>\n\n'
-            "💡 Путь должен указывать на ПАПКУ. Для замены материала — /setcontent",
+            'Пример: <code>/addcontent "Отдел продаж/Материалы" text</code>',
             parse_mode="HTML")
         return
 
@@ -750,22 +759,18 @@ def cmd_add_content_start(message):
         return
 
     if content_type not in ('text', 'photo', 'document', 'text_with_link'):
-        bot.send_message(message.chat.id, f"❌ Неизвестный тип: {content_type}\nДопустимые: text, photo, document, text_with_link")
+        bot.send_message(message.chat.id, f"❌ Неизвестный тип: {content_type}")
         return
 
     path_parts = split_path(path_str)
     parent = get_children(path_parts)
-
     if parent is None:
-        # Уточняем причину ошибки
         val, _, ntype = resolve_path(path_parts)
         if ntype == 'content':
             bot.send_message(message.chat.id,
                 f"❌ <b>{escape_html('/'.join(path_parts))}</b> — это уже готовый материал, а не папка.\n\n"
                 f"• Чтобы ЗАМЕНИТЬ его содержимое:\n"
-                f'<code>/setcontent "{escape_html("/".join(path_parts))}" {content_type}</code>\n\n'
-                f"• Чтобы добавить материал РЯДОМ, укажи путь к ПАПКЕ:\n"
-                f'<code>/addcontent "{escape_html("/".join(path_parts[:-1]))}" {content_type}</code>',
+                f'<code>/setcontent "{escape_html("/".join(path_parts))}" {content_type}</code>',
                 parse_mode="HTML")
             return
         bot.send_message(message.chat.id, f"❌ Путь не найден: {escape_html('/'.join(path_parts))}")
@@ -776,7 +781,6 @@ def cmd_add_content_start(message):
 
 @bot.message_handler(commands=['setcontent'])
 def cmd_set_content_start(message):
-    """ЗАМЕНЯЕТ содержимое СУЩЕСТВУЮЩЕГО материала."""
     if not is_admin(message.from_user.id):
         bot.send_message(message.chat.id, "🚫 Только для администраторов.")
         return
@@ -784,8 +788,7 @@ def cmd_set_content_start(message):
     if len(parts) < 2:
         bot.send_message(message.chat.id,
             'ℹ️ Использование:\n<code>/setcontent "путь к МАТЕРИАЛУ" тип</code>\n\n'
-            'Пример: <code>/setcontent "Отдел продаж/Материалы/Оферта" text_with_link</code>\n\n'
-            "💡 Заменяет содержимое уже существующего материала.",
+            'Пример: <code>/setcontent "Отдел продаж/Материалы/Оферта" text_with_link</code>',
             parse_mode="HTML")
         return
 
@@ -811,7 +814,6 @@ def cmd_set_content_start(message):
             parse_mode="HTML")
         return
 
-    # Это контент — можно заменять. Используем реальные ключи.
     _start_content_input(message, actual_keys, content_type, mode='set')
 
 
@@ -856,6 +858,7 @@ def cmd_search(message):
     for r in results:
         text += f"• <b>{escape_html(r['title'])}</b>\n  {r['preview']}\n\n"
     bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
 
 # ============================================================
 # ЕДИНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
@@ -906,7 +909,6 @@ def handle_all_messages(message):
                         user_states[user_id].update({"step": "waiting_label", "data": data, "caption": caption})
                     else:
                         return
-                # Для set-режима название не нужно — сразу сохраняем
                 _maybe_finish_set(message, user_id)
                 return
 
@@ -951,9 +953,9 @@ def handle_all_messages(message):
             return
         if message.text and len(message.text.strip()) > 2:
             query = message.text.strip()
-            query_safe = escape_html(query)
             if len(query) > 50:
                 query = query[:50]
+            query_safe = escape_html(query)
             results = search_kb(query)
             markup = types.InlineKeyboardMarkup()
             if results:
@@ -962,10 +964,15 @@ def handle_all_messages(message):
                     if len(cb.encode('utf-8')) <= 64:
                         markup.add(types.InlineKeyboardButton(f"📄 {r['title']}", callback_data=cb))
                 markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main"))
-                bot.send_message(message.chat.id, f"🔍 Нашёл по запросу <b>{query_safe}</b>:\n\n" + "\n".join(f"• {escape_html(r['title'])}" for r in results[:5]), parse_mode="HTML", reply_markup=markup)
+                bot.send_message(message.chat.id,
+                    f"🔍 Нашёл по запросу <b>{query_safe}</b>:\n\n" +
+                    "\n".join(f"• {escape_html(r['title'])}" for r in results[:5]),
+                    parse_mode="HTML", reply_markup=markup)
             else:
                 markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main"))
-                bot.send_message(message.chat.id, f"🔍 По запросу <b>{query_safe}</b> ничего не найдено.", parse_mode="HTML", reply_markup=markup)
+                bot.send_message(message.chat.id,
+                    f"🔍 По запросу <b>{query_safe}</b> ничего не найдено.",
+                    parse_mode="HTML", reply_markup=markup)
         else:
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("🏠 Главное меню", callback_data="main"))
@@ -975,21 +982,18 @@ def handle_all_messages(message):
 
 
 def _maybe_finish_set(message, user_id):
-    """Если режим set — сохраняем сразу без запроса названия. Иначе просим название."""
     with user_states_lock:
         state = user_states.get(user_id)
         if not state:
             return
         mode = state.get("mode", "add")
     if mode == 'set':
-        # Путь уже указывает на существующий материал — заменяем его data
         _save_content(message, user_id, label=None)
     else:
         bot.send_message(message.chat.id, "🔑 Введите название кнопки.\nПример: <b>Новый материал</b>", parse_mode="HTML")
 
 
 def _save_content(message, user_id, label):
-    """Сохраняет контент. Если label=None — режим set (замена существующего)."""
     with user_states_lock:
         state = user_states.get(user_id)
         if not state:
@@ -1001,14 +1005,12 @@ def _save_content(message, user_id, label):
         mode         = state.get("mode", "add")
 
     if mode == 'set':
-        # path_parts указывает на сам материал. Идём к родителю и заменяем.
         parent = get_children(path_parts[:-1])
         if parent is None:
             bot.send_message(message.chat.id, f"❌ Путь не найден: {escape_html('/'.join(path_parts[:-1]))}")
             with user_states_lock:
                 user_states.pop(user_id, None)
             return
-        # Находим реальный ключ
         norm = normalize_key(path_parts[-1]).lower()
         real_key = None
         for k in parent.keys():
@@ -1058,6 +1060,7 @@ def _save_content(message, user_id, label):
     bot.send_message(message.chat.id, f"✅ Материал добавлен как '{new_key}'.")
     notify_admins(f"📄 Админ {user_id} добавил '{new_key}' в /{'/'.join(path_parts)}/")
 
+
 # ============================================================
 # ОБРАБОТКА КНОПОК
 # ============================================================
@@ -1098,7 +1101,7 @@ def handle(call):
             full_path = path_parts + [name]
             val, actual_keys, ntype = resolve_path(full_path)
             if ntype is None:
-                # Возможно поиск — ищем имя в любом месте дерева
+                # Ищем по имени
                 results = search_kb(name)
                 match = next((r for r in results if normalize_key(r['title']).lower() == normalize_key(name).lower()), None)
                 if match:
@@ -1125,6 +1128,7 @@ def handle(call):
         logger.error(f"Ошибка при кнопке '{data}': {e}")
         answer_query(call.id, "Произошла ошибка, попробуйте ещё раз", alert=True)
 
+
 # ============================================================
 # ЗАПУСК С ОБРАБОТКОЙ 409
 # ============================================================
@@ -1148,8 +1152,6 @@ if __name__ == "__main__":
             )
         except ApiTelegramException as e:
             if e.error_code == 409:
-                # Старый инстанс ещё жив (частая ситуация на Railway при деплое).
-                # Ждём 15 секунд — за это время старый процесс умрёт, и пробуем снова.
                 logger.warning("409 Conflict: другой инстанс активен. Жду 15 сек...")
                 time.sleep(15)
                 try:
