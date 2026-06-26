@@ -867,9 +867,6 @@ def get_webhook_url():
             webhook_url = f"https://{railway_domain}/webhook"
             if not webhook_url.startswith('https://'):
                 webhook_url = 'https://' + webhook_url.lstrip('http://')
-    # Надёжная замена протокола, если вдруг остался http://
-    if webhook_url and webhook_url.startswith('http://'):
-        webhook_url = 'https://' + webhook_url[len('http://'):]
     return webhook_url
 
 # ============================================================
@@ -1126,7 +1123,7 @@ def handle(call):
         answer_query(call.id, "Произошла ошибка, попробуйте ещё раз", alert=True)
 
 # ============================================================
-# ЗАПУСК С ВЕБХУКОМ
+# ЗАПУСК С ВЕБХУКОМ (финальная версия)
 # ============================================================
 if __name__ == "__main__":
     logger.info("🚀 Бот ДЦША запускается...")
