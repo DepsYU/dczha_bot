@@ -492,7 +492,7 @@ def cmd_remove_user(message):
         bot.send_message(message.chat.id, "🚫 Только для администраторов.")
         return
     args = message.text.split()
-    if len(args) < 2:
+    if len(args) < 2):
         bot.send_message(message.chat.id, "ℹ️ Использование: /removeuser 123456789")
         return
     try:
@@ -1130,37 +1130,49 @@ def handle(call):
 
 
 # ============================================================
-# ЗАПУСК С ОБРАБОТКОЙ 409
+# ЗАПУСК С УЛУЧШЕННОЙ ОБРАБОТКОЙ 409
 # ============================================================
 if __name__ == "__main__":
     logger.info("🚀 Бот ДЦША запускается...")
+
+    # Сброс webhook и ожидание завершения старых инстансов
     try:
         bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён, pending updates сброшены.")
     except Exception as e:
         logger.warning(f"Не удалось удалить webhook: {e}")
 
+    # Даём время старому контейнеру завершиться
+    time.sleep(5)
+
     notify_admins("✅ Бот запущен и работает.")
     logger.info("✅ Бот ДЦША запущен.")
 
+    # Основной цикл с переподключением при 409
     while True:
         try:
-            bot.infinity_polling(
+            bot.polling(
                 timeout=60,
                 long_polling_timeout=30,
-                allowed_updates=["message", "callback_query"]
+                allowed_updates=["message", "callback_query"],
+                interval=0,
+                non_stop=True
             )
         except ApiTelegramException as e:
             if e.error_code == 409:
                 logger.warning("409 Conflict: другой инстанс активен. Жду 15 сек...")
                 time.sleep(15)
+                # Пробуем снова сбросить webhook
                 try:
                     bot.delete_webhook(drop_pending_updates=True)
                 except Exception:
                     pass
+                continue
             else:
                 logger.critical(f"Telegram API ошибка {e.error_code}: {e}. Жду 5 сек.")
                 time.sleep(5)
+                continue
         except Exception as e:
             logger.critical(f"❌ Бот упал: {e}. Перезапуск через 5 сек.")
             time.sleep(5)
+            continue
