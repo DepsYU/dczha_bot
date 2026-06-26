@@ -171,13 +171,6 @@ def normalize_key(key):
     return ' '.join(str(key).strip().split())
 
 def resolve_path(path_parts):
-    """
-    Идёт по дереву с нормализацией имён.
-    Возвращает (node, actual_keys, node_type):
-      node       — сам узел (для контента это dict с data; для категории — dict категории)
-      actual_keys — реальные ключи как в kb (с правильными пробелами/регистром)
-      node_type  — 'category' | 'content' | None (если не найден)
-    """
     node = kb['main_menu']
     actual_keys = []
     for i, part in enumerate(path_parts):
@@ -207,17 +200,7 @@ def get_children(path_parts):
         return val['children']
     return None
 
-def get_actual_path(path_parts):
-    if not path_parts:
-        return []
-    _, actual_keys, _ = resolve_path(path_parts)
-    return actual_keys
-
 def parse_quoted(text):
-    """
-    Разбирает '"путь" "имя"' или '"путь" слово'.
-    Возвращает (path_str, second) где second — имя или тип.
-    """
     text = text.strip()
     if text.startswith('"'):
         end = text.find('"', 1)
@@ -426,7 +409,8 @@ def cmd_help(message):
         '/addcontent "путь" тип — добавить материал в папку\n'
         '/setcontent "путь" тип — ЗАМЕНИТЬ существующий материал\n'
         '/delete "путь" — удалить элемент\n'
-        "/reloadkb — перезагрузить базу знаний\n\n"
+        "/reloadkb — перезагрузить базу знаний\n"
+        "/restart — сбросить webhook и перезапустить соединение (админ)\n\n"
         "<b>Примеры:</b>\n"
         '<code>/addcontent "Отдел продаж/Материалы" text</code>\n'
         '<code>/setcontent "Отдел продаж/Материалы/Оферта" text_with_link</code>\n'
@@ -492,7 +476,7 @@ def cmd_remove_user(message):
         bot.send_message(message.chat.id, "🚫 Только для администраторов.")
         return
     args = message.text.split()
-    if len(args) < 2):
+    if len(args) < 2:   # <--- ИСПРАВЛЕНО (убрана лишняя скобка)
         bot.send_message(message.chat.id, "ℹ️ Использование: /removeuser 123456789")
         return
     try:
@@ -657,9 +641,6 @@ def cmd_add_category(message):
     bot.send_message(message.chat.id, f"✅ Папка <b>{escape_html(new_name)}</b> создана в {escape_html(location)}.", parse_mode="HTML")
 
 
-# ============================================================
-# ИСПРАВЛЕННАЯ КОМАНДА DELETE (поддерживает удаление элементов с / в названии)
-# ============================================================
 @bot.message_handler(commands=['delete'])
 def cmd_delete(message):
     if not is_admin(message.from_user.id):
@@ -673,24 +654,19 @@ def cmd_delete(message):
             parse_mode="HTML")
         return
 
-    # Получаем путь из кавычек (если они есть) или целиком
     raw = parts[1].strip()
     if raw.startswith('"') and raw.endswith('"'):
         path_str = raw[1:-1]
     else:
         path_str = raw
 
-    # Разбиваем по /, но если в названии есть / — это не проблема, потому что весь путь взят в кавычки
     path_parts = [p.strip() for p in path_str.split('/') if p.strip()]
     if not path_parts:
         bot.send_message(message.chat.id, "❌ Нельзя удалить главное меню.")
         return
 
-    # Идём к родителю
     parent = get_children(path_parts[:-1])
     if parent is None:
-        # Проверим, может быть путь указывает на контент (тогда parent должен быть на уровень выше)
-        # Но мы уже сделали parent = get_children(path_parts[:-1]), так что если родитель не найден — ошибка.
         bot.send_message(message.chat.id, f"❌ Путь не найден: {escape_html('/'.join(path_parts[:-1]))}")
         return
 
@@ -708,33 +684,6 @@ def cmd_delete(message):
         bot.send_message(message.chat.id, f"✅ Элемент <b>{escape_html(found)}</b> удалён.", parse_mode="HTML")
     else:
         bot.send_message(message.chat.id, f"❌ Элемент '{target}' не найден.")
-
-
-# ============================================================
-# ОСТАЛЬНЫЕ КОМАНДЫ (addcontent, setcontent, search, etc.)
-# ============================================================
-
-def _start_content_input(message, path_parts, content_type, mode):
-    with user_states_lock:
-        user_states[message.from_user.id] = {
-            "step": "waiting_data",
-            "path": path_parts,
-            "content_type": content_type,
-            "mode": mode
-        }
-    type_hints = {
-        "text":          "напишите текст",
-        "text_with_link":"напишите текст с HTML-ссылками: &lt;a href='url'&gt;текст&lt;/a&gt;",
-        "photo":         "отправьте фото (можно альбом)",
-        "document":      "отправьте файл (PDF и др.)"
-    }
-    action = "ЗАМЕНА материала" if mode == 'set' else "Новый материал в папке"
-    bot.send_message(message.chat.id,
-        f"✏️ {action}: <b>/{'/'.join(path_parts)}/</b>\n"
-        f"Тип: <b>{content_type}</b>\n\n"
-        f"Действие: {type_hints.get(content_type, 'отправьте контент')}\n\n"
-        f"Для отмены: /cancel",
-        parse_mode="HTML")
 
 
 @bot.message_handler(commands=['addcontent'])
@@ -858,6 +807,20 @@ def cmd_search(message):
     for r in results:
         text += f"• <b>{escape_html(r['title'])}</b>\n  {r['preview']}\n\n"
     bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.message_handler(commands=['restart'])
+def cmd_restart(message):
+    if not is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "🚫 Только для администраторов.")
+        return
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        bot.send_message(message.chat.id, "✅ Webhook сброшен. Соединение будет перезапущено автоматически.")
+        logger.info(f"Админ {message.from_user.id} сбросил webhook.")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка сброса webhook: {e}")
+        logger.error(f"Ошибка сброса webhook: {e}")
 
 
 # ============================================================
@@ -1101,7 +1064,6 @@ def handle(call):
             full_path = path_parts + [name]
             val, actual_keys, ntype = resolve_path(full_path)
             if ntype is None:
-                # Ищем по имени
                 results = search_kb(name)
                 match = next((r for r in results if normalize_key(r['title']).lower() == normalize_key(name).lower()), None)
                 if match:
@@ -1135,12 +1097,15 @@ def handle(call):
 if __name__ == "__main__":
     logger.info("🚀 Бот ДЦША запускается...")
 
-    # Сброс webhook и ожидание завершения старых инстансов
-    try:
-        bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook удалён, pending updates сброшены.")
-    except Exception as e:
-        logger.warning(f"Не удалось удалить webhook: {e}")
+    # Пытаемся сбросить webhook несколько раз с задержкой
+    for attempt in range(3):
+        try:
+            bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook удалён.")
+            break
+        except Exception as e:
+            logger.warning(f"Попытка {attempt+1} сброса webhook не удалась: {e}")
+            time.sleep(2)
 
     # Даём время старому контейнеру завершиться
     time.sleep(5)
@@ -1149,6 +1114,7 @@ if __name__ == "__main__":
     logger.info("✅ Бот ДЦША запущен.")
 
     # Основной цикл с переподключением при 409
+    attempts = 0
     while True:
         try:
             bot.polling(
@@ -1158,11 +1124,13 @@ if __name__ == "__main__":
                 interval=0,
                 non_stop=True
             )
+            attempts = 0
         except ApiTelegramException as e:
             if e.error_code == 409:
-                logger.warning("409 Conflict: другой инстанс активен. Жду 15 сек...")
-                time.sleep(15)
-                # Пробуем снова сбросить webhook
+                attempts += 1
+                wait = min(5 * attempts, 60)
+                logger.warning(f"409 Conflict (попытка {attempts}). Жду {wait} сек...")
+                time.sleep(wait)
                 try:
                     bot.delete_webhook(drop_pending_updates=True)
                 except Exception:
